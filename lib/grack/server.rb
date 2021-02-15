@@ -3,8 +3,13 @@ require 'rack/request'
 require 'rack/response'
 require 'rack/utils'
 require 'time'
+require 'json'
+require 'fileutils'
+
 
 require 'grack/git'
+require 'grack/lfs'
+
 
 module Grack
   class Server
@@ -14,6 +19,9 @@ module Grack
       ["POST", 'service_rpc',      "(.*?)/git-upload-pack$",  'upload-pack'],
       ["POST", 'service_rpc',      "(.*?)/git-receive-pack$", 'receive-pack'],
 
+      ["POST", 'lfs_batch_request',"(.*?)/info/lfs/objects/batch$"],
+      ["GET PUT",  'lfs_file',       "(.*?)/info/lfs/objects/([a-f0-9]{64})$"],
+      
       ["GET",  'get_info_refs',    "(.*?)/info/refs$"],
       ["GET",  'get_text_file',    "(.*?)/HEAD$"],
       ["GET",  'get_text_file',    "(.*?)/objects/info/alternates$"],
@@ -52,7 +60,8 @@ module Grack
 
       @git = get_git(path)
       return render_not_found unless git.valid_repo?
-
+      puts cmd
+      puts @rpc
       self.method(cmd).call
     end
 
@@ -65,7 +74,11 @@ module Grack
     # http://en.wikipedia.org/wiki/Chunked_transfer_encoding
 
     CRLF = "\r\n"
-
+    
+    # potential improvement
+    # 
+    # this doesnt have to be chunked
+    #
     def service_rpc
       return render_no_access unless has_access?(@rpc, true)
 
@@ -77,13 +90,17 @@ module Grack
       @res["Transfer-Encoding"] = "chunked"
       @res["Cache-Control"] = "no-cache"
 
+      
+
       @res.finish do
         git.execute([@rpc, '--stateless-rpc', git.repo]) do |pipe|
           pipe.write(input)
           pipe.close_write
 
+          chunk_count = 0
           while block = pipe.read(8192)     # 8KB at a time
-            @res.write encode_chunk(block)  # stream it to the client
+            chunk = encode_chunk(block)
+            @res.write chunk  # stream it to the client
           end
 
           @res.write terminating_chunk
@@ -156,6 +173,128 @@ module Grack
       end
     end
 
+    # -----------------------
+    # LFS
+    # ----------------------
+
+    def lfs_batch_request
+      json_body = @req.body.read
+      req_body = JSON.parse(json_body)
+
+      operation = req_body["operation"]
+      objects = req_body["objects"]
+
+      # TODO - verify body
+
+
+      objects_res = []
+      base_url = @req.base_url + @req.script_name + @git.path + "/info/lfs/objects/"
+      
+      # TODO - validate oid and size exist and are valid
+      objects.each do |obj|
+        size = obj["size"]
+        oid = obj["oid"]
+        obj_res = obj.clone
+        key_path = transform_key(oid)
+        path = File.join(git.repo, "lfs/objects", key_path)
+        url = base_url + oid
+        exists = File.exist?(path)
+
+        
+        actions = {}
+        error_code = 0
+
+        if operation == "download"
+          if exists
+            actions["download"] = { 'href' => url }
+            
+          else
+            error_code = 400
+          end
+        elsif operation == "upload"
+          # if we already have the file
+          # send no action
+          if !exists
+            actions["upload"] = { 'href' => url }
+          end
+        end
+
+        if error_code != 0
+          obj_res["error"] = {
+            'code' => error_code,
+            'message' => ""
+          }
+        elsif
+          obj_res["actions"] = actions
+        end
+
+        objects_res.append obj_res
+      end
+      body = { "transfer" => "basic", "objects" => objects_res }.to_json
+      [200, {"Content-Type" => 'application/vnd.git-lfs+json'}, [body]]
+    end
+
+    
+    def lfs_obj_action(oid, size, url, authenticated)
+      
+      {
+        'oid'           => oid,
+        'size'          => size,
+        'authenticated' => false,
+        'actions'       => {
+          'upload' => {
+            'href'       => url
+          },
+        },
+      }
+    end
+    # the client seems to be using something similar
+    def transform_key(key)
+      # the github server implmentation uses this but maybe short keys
+      # should be rejected
+	  if key.length < 5
+		return key
+	  end
+      
+	  File.join(key[0..1], key[2..3], key)
+    end
+
+    
+    def lfs_file
+      puts "lfs upload"
+      return [400] unless match = Regexp.new("(.*?)/info/lfs/objects/([a-f0-9]{64})").match(@req.path_info)
+
+      key = match[2]
+     
+      
+      if @req.request_method == "GET"
+        lfs_file_download(key)
+      elsif  @req.request_method == "PUT"
+        lfs_file_upload(key)
+      end
+    end
+
+    def lfs_file_download(key)
+      puts "downloading"
+      key = transform_key(key)
+      path = File.join("lfs/objects", key)
+      send_file(path, "application/octet-stream") do end
+    end
+
+    def lfs_file_upload(key)
+      # TODO make sure file doesnt exist
+      puts "uploading"
+
+      obj_folder = File.join(@git.repo, "lfs/objects", key[0..1], key[2..3])
+      path = File.join(obj_folder, key)
+      
+      FileUtils.mkdir_p(obj_folder)
+      File.write(path, @req.body.read)
+      @res = Rack::Response.new
+      @res.status = 200
+      @res.finish
+    end
+
     # ------------------------
     # logic helping functions
     # ------------------------
@@ -196,8 +335,8 @@ module Grack
 
     def get_git(path)
       root = @config[:project_root] || Dir.pwd
-      path = File.join(root, path)
-      Grack::Git.new(@config[:git_path], path)
+      #path = File.join(root, path)
+      Grack::Git.new(@config[:git_path], path, root)
     end
 
     def get_service_type
@@ -214,7 +353,7 @@ module Grack
       SERVICES.each do |method, handler, match, rpc|
         next unless m = Regexp.new(match).match(@req.path_info)
 
-        return ['not_allowed'] unless method == @req.request_method
+        return ['not_allowed'] unless method.include? @req.request_method
 
         cmd = handler
         path = m[1]

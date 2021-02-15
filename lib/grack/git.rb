@@ -1,12 +1,19 @@
 module Grack
   class Git
-    attr_reader :repo
+    #attr_reader :repo
 
-    def initialize(git_path, repo_path)
+    def initialize(git_path, repo_path, repo_root)
       @git_path = git_path
-      @repo = repo_path
+      @path = repo_path
+      @root = repo_root
     end
 
+    def path
+      @path
+    end
+    def repo
+      File.join(@root, @path)
+    end
     def update_server_info
       execute(%W(update-server-info))
     end
